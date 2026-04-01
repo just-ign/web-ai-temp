@@ -5,6 +5,7 @@ import os
 import re
 import json
 import time
+import datetime
 import subprocess
 
 try:
@@ -192,10 +193,95 @@ def get_startup_failure_context(host, profile, system_out_log_path):
 
 
 # -----------------------------------------------------------------------------
+# EXCEL REPORT
+# -----------------------------------------------------------------------------
+REPORT_COLUMNS = ["Patched server", "status", "cause", "ai action"]
+
+
+def _new_jvm_report():
+    return {
+        "shutdown_ai": None,
+        "startup_ai": None,
+        "notes": [],
+        "restart_attempted": False,
+        "recovered": False,
+    }
+
+
+def _report_row(host, jvm, status, cause, ai_action):
+    return {
+        "Patched server": "{0} / {1}".format(host, jvm),
+        "status": status,
+        "cause": cause,
+        "ai action": ai_action,
+    }
+
+
+def _jvm_ai_text(info):
+    if not info:
+        return ""
+    parts = []
+    if info.get("shutdown_ai"):
+        parts.append("Shutdown analysis:\n{0}".format(info["shutdown_ai"]))
+    if info.get("startup_ai"):
+        parts.append("Startup failure analysis:\n{0}".format(info["startup_ai"]))
+    return "\n\n".join(parts)
+
+
+def _jvm_cause_text(info, running):
+    info = info or {}
+    if running:
+        if info.get("recovered"):
+            return "Recovered after automated restart"
+        return ""
+    parts = []
+    if info.get("restart_attempted") and not info.get("recovered"):
+        parts.append("Still down after restart attempt(s)")
+    parts.extend(info.get("notes") or [])
+    return "; ".join(parts) if parts else "Down"
+
+
+def write_excel_report(rows, output_path):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("Excel report skipped: install openpyxl (pip install openpyxl)")
+        return False
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Servers"
+    ws.append(REPORT_COLUMNS)
+    for row in rows:
+        ws.append([row.get(col, "") for col in REPORT_COLUMNS])
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=4):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    for idx in range(1, len(REPORT_COLUMNS) + 1):
+        letter = get_column_letter(idx)
+        col_cells = [ws.cell(row=r, column=idx) for r in range(1, ws.max_row + 1)]
+        maxlen = min(max(len(str(c.value or "")) for c in col_cells), 60)
+        ws.column_dimensions[letter].width = max(12, maxlen + 2)
+
+    wb.save(output_path)
+    return True
+
+
+# -----------------------------------------------------------------------------
 # HANDLE SERVER
 # -----------------------------------------------------------------------------
 def handle_server(group_name, host, profile, global_settings):
     print("\n{0} :: {1}".format(group_name, host))
+
+    per_jvm_info = {}
+
+    def ensure_jvm(j):
+        if j not in per_jvm_info:
+            per_jvm_info[j] = _new_jvm_report()
 
     status_result = ssh_exec(
         host,
@@ -207,9 +293,18 @@ def handle_server(group_name, host, profile, global_settings):
     if not status_result["success"]:
         print("SSH/status failed")
         print(status_result["stderr"])
-        return
+        cause = (status_result.get("stderr") or status_result.get("stdout") or "").strip() or "unknown"
+        return [
+            {
+                "Patched server": "{0} | {1}".format(host, group_name),
+                "status": "Status check failed",
+                "cause": cause,
+                "ai action": "",
+            }
+        ]
 
     configured, started, down = parse_websphere_status(status_result["stdout"])
+    initial_configured = list(configured)
 
     print("Configured JVMs: {0}".format(", ".join(configured) if configured else "None"))
     print("Running JVMs   : {0}".format(", ".join(started) if started else "None"))
@@ -217,14 +312,18 @@ def handle_server(group_name, host, profile, global_settings):
 
     if not down:
         print("All JVMs are running")
-        return
+        return [
+            _report_row(host, j, "Running", "", "") for j in configured
+        ]
 
     for jvm in down:
         print("\nJVM DOWN: {0}".format(jvm))
+        ensure_jvm(jvm)
 
         match = re.search(r'_(wsvmt\d+)_', jvm)
         if not match:
             print("Cannot determine profile")
+            per_jvm_info[jvm]["notes"].append("Cannot determine profile (expected _wsvmt#_ in server name)")
             continue
 
         profile_suffix = match.group(1)
@@ -254,10 +353,12 @@ Logs:
 {1}
 """.format(jvm, logs[-8000:]))
 
+            per_jvm_info[jvm]["shutdown_ai"] = ai_response
             print("\nShutdown Analysis:")
             print(ai_response)
         else:
             print("No shutdown logs found")
+            per_jvm_info[jvm]["notes"].append("No shutdown logs found")
 
         start_script = "{0}/bin/startServer.sh".format(was_home)
         start_command = "{0} {1}".format(start_script, jvm)
@@ -285,10 +386,12 @@ Logs:
             if jvm in started_now:
                 print("Started successfully")
                 started_successfully = True
+                per_jvm_info[jvm]["recovered"] = True
                 break
 
         if not started_successfully:
             print("Failed to start")
+            per_jvm_info[jvm]["restart_attempted"] = True
 
             startup_logs = get_startup_failure_context(host, profile, log_path)
 
@@ -309,8 +412,13 @@ Logs (SystemOut.log and native_stderr.log, last 300 lines each):
 {1}
 """.format(jvm, startup_logs[-8000:]))
 
+                per_jvm_info[jvm]["startup_ai"] = ai_start_response
                 print("\nStartup Failure Analysis:")
                 print(ai_start_response)
+            else:
+                per_jvm_info[jvm]["notes"].append(
+                    "Failed to start; startup logs unavailable for AI analysis"
+                )
 
     final_check = ssh_exec(
         host,
@@ -321,7 +429,19 @@ Logs (SystemOut.log and native_stderr.log, last 300 lines each):
 
     if not final_check["success"]:
         print("\nFinal status recheck failed for host: {0}".format(host))
-        return
+        rows = []
+        for jvm in initial_configured:
+            info = per_jvm_info.get(jvm)
+            rows.append(
+                _report_row(
+                    host,
+                    jvm,
+                    "Unknown",
+                    "Final status recheck failed (SSH or empty output)",
+                    _jvm_ai_text(info),
+                )
+            )
+        return rows
 
     final_configured, final_started, final_down = parse_websphere_status(final_check["stdout"])
 
@@ -335,6 +455,21 @@ Logs (SystemOut.log and native_stderr.log, last 300 lines each):
     else:
         print("Some JVMs are still DOWN")
 
+    rows = []
+    for jvm in final_configured:
+        running = jvm in final_started
+        info = per_jvm_info.get(jvm)
+        rows.append(
+            _report_row(
+                host,
+                jvm,
+                "Running" if running else "Down",
+                _jvm_cause_text(info, running),
+                _jvm_ai_text(info) if (not running or (info and (info.get("shutdown_ai") or info.get("startup_ai")))) else "",
+            )
+        )
+    return rows
+
 
 # -----------------------------------------------------------------------------
 # MAIN
@@ -346,6 +481,8 @@ def main():
     profiles = config.get("middleware_profiles", {})
     server_groups = config.get("server_groups", {})
 
+    all_rows = []
+
     for group_name, group in server_groups.items():
         profile_name = group.get("profile")
         profile = profiles.get(profile_name)
@@ -355,7 +492,18 @@ def main():
             continue
 
         for host in group.get("hosts", []):
-            handle_server(group_name, host, profile, global_settings)
+            rows = handle_server(group_name, host, profile, global_settings)
+            if rows:
+                all_rows.extend(rows)
+
+    report_path = os.getenv(
+        "WEB_AI_REPORT",
+        "websphere_monitor_report_{0}.xlsx".format(
+            datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ),
+    )
+    if write_excel_report(all_rows, report_path):
+        print("\nExcel report written: {0}".format(os.path.abspath(report_path)))
 
 
 # -----------------------------------------------------------------------------
