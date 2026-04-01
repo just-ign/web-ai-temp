@@ -7,6 +7,9 @@ import json
 import time
 import datetime
 import subprocess
+from openpyxl import Workbook
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 try:
     import requests
@@ -242,14 +245,6 @@ def _jvm_cause_text(info, running):
 
 
 def write_excel_report(rows, output_path):
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        print("Excel report skipped: install openpyxl (pip install openpyxl)")
-        return False
-
     wb = Workbook()
     ws = wb.active
     ws.title = "Servers"
