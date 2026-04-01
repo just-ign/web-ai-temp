@@ -1,0 +1,34 @@
+{
+  "global_settings": {
+    "retry_count": 3,
+    "wait_time_seconds": 60,
+    "log_tail_lines": 300,
+    "ai_max_log_chars": 8000
+  },
+  "middleware_profiles": {
+    "websphere_dev_profile": {
+      "middleware": "websphere",
+      "ssh_user": "wasadmin",
+      "ssh_key_path": "~/.ssh/id_rsa",
+      "commands": {
+        "status": "/was/websvcs/sh/websphered status",
+        "start": "/was/websvcs/sh/websphered start",
+        "stop": "/was/websvcs/sh/websphered stop",
+        "recycle": "/was/websvcs/sh/websphered recycle"
+      },
+      "log_paths": {
+        "dmgr": "/was/wasprofile855/*dmgr/logs/dmgr/SystemOut.log",
+        "nodeagent": "/was/wasprofile855/*/logs/nodeagent/SystemOut.log",
+        "jvm_root": "/was/wasprofile855"
+      }
+    }
+  },
+  "server_groups": {
+    "DEV_WSVMT_CLUSTER": {
+      "profile": "websphere_dev_profile",
+      "hosts": [
+        "10.112.114.131"
+      ]
+    }
+  }
+}
