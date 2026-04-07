@@ -210,25 +210,33 @@ def get_startup_failure_context(host, profile, system_out_log_path):
 # -----------------------------------------------------------------------------
 # EXCEL REPORT
 # -----------------------------------------------------------------------------
-REPORT_COLUMNS = ["Patched server", "status", "cause", "ai action"]
+REPORT_COLUMNS = [
+    "Patched server",
+    "Status",
+    "Cause",
+    "AI Action",
+    "L1 validation steps",
+]
 
 
 def _new_jvm_report():
     return {
         "shutdown_ai": None,
         "startup_ai": None,
+        "l1_validation_steps": "",
         "notes": [],
         "restart_attempted": False,
         "recovered": False,
     }
 
 
-def _report_row(host, jvm, status, cause, ai_action):
+def _report_row(host, jvm, status, cause, ai_action, l1_validation_steps=""):
     return {
         "Patched server": "{0} / {1}".format(host, jvm),
-        "status": status,
-        "cause": cause,
-        "ai action": ai_action,
+        "Status": status,
+        "Cause": cause,
+        "AI Action": ai_action,
+        "L1 validation steps": l1_validation_steps,
     }
 
 
@@ -264,7 +272,12 @@ def write_excel_report(rows, output_path):
     for row in rows:
         ws.append([row.get(col, "") for col in REPORT_COLUMNS])
 
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=4):
+    for row in ws.iter_rows(
+        min_row=2,
+        max_row=ws.max_row,
+        min_col=1,
+        max_col=len(REPORT_COLUMNS),
+    ):
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
@@ -576,9 +589,10 @@ def handle_server(group_name, host, profile, global_settings):
         return [
             {
                 "Patched server": "{0} | {1}".format(host, group_name),
-                "status": "Status check failed",
-                "cause": cause,
-                "ai action": "",
+                "Status": "Status check failed",
+                "Cause": cause,
+                "AI Action": "",
+                "L1 validation steps": "",
             }
         ]
 
@@ -808,6 +822,20 @@ Additional host/runtime diagnostic context:
                 if validation_text:
                     ai_text += "\n\n" + validation_text
 
+                l1_step_parts = []
+                if isinstance(diag, dict) and diag.get("console_fix_navigation"):
+                    l1_step_parts.append(
+                        "Check/Fix from Console by navigating to:\n{0}".format(
+                            diag["console_fix_navigation"]
+                        )
+                    )
+                if validation_text:
+                    l1_step_parts.append(validation_text)
+                if l1_step_parts:
+                    per_jvm_info[jvm]["l1_validation_steps"] = "\n\n".join(
+                        l1_step_parts
+                    )
+
                 per_jvm_info[jvm]["startup_ai"] = ai_text
             else:
                 per_jvm_info[jvm]["notes"].append(
@@ -833,6 +861,7 @@ Additional host/runtime diagnostic context:
                     "Unknown",
                     "Final status recheck failed (SSH or empty output)",
                     _jvm_ai_text(info),
+                    (info or {}).get("l1_validation_steps", ""),
                 )
             )
         return rows
@@ -881,6 +910,7 @@ Additional host/runtime diagnostic context:
                     )
                     else ""
                 ),
+                (info or {}).get("l1_validation_steps", ""),
             )
         )
     return rows
