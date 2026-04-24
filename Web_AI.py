@@ -166,45 +166,119 @@ def get_latest_shutdown_context(host, profile, jvm, log_path):
 
 
 # -----------------------------------------------------------------------------
-# GET STARTUP FAILURE LOGS
+# NATIVE STDOUT (initial down-JVM triage, after SystemOut)
+# -----------------------------------------------------------------------------
+def get_native_stdout_tail(host, profile, system_out_log_path, lines=200):
+    """
+    Tail native_stdout.log in the same directory as SystemOut.log.
+    Returns stripped text or empty string if missing/unreadable.
+    """
+    path = os.path.join(os.path.dirname(system_out_log_path), "native_stdout.log")
+    res = ssh_exec(
+        host,
+        profile["ssh_user"],
+        profile.get("ssh_key_path"),
+        "tail -n {0} {1}".format(lines, path),
+    )
+    if not res["success"]:
+        return ""
+    return (res.get("stdout") or "").rstrip()
+
+
+# -----------------------------------------------------------------------------
+# STARTSERVER.LOG CONFIDENCE (whether native_stderr is needed)
+# -----------------------------------------------------------------------------
+def is_startserver_log_confident(text):
+    """
+    True if startServer.log tail is plausibly actionable for root-cause analysis.
+    If False, native_stderr.log is tailed as a fallback.
+    """
+    if not text or not str(text).strip():
+        return False
+    t = str(text).strip()
+    if len(t) < 100:
+        return False
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    if len(t) > 900:
+        return True
+    if re.search(
+        r"(?i)(exception|error|severe|failed|fatal|cannot launch|could not|"
+        r"unavailable|java\.lang\.|adm\d{4}|wsvr0|admu)",
+        t,
+    ):
+        return True
+    return len(lines) >= 14
+
+
+# -----------------------------------------------------------------------------
+# GET STARTUP FAILURE LOGS (after first failed start: startServer, then stderr)
 # -----------------------------------------------------------------------------
 def get_startup_failure_context(host, profile, system_out_log_path):
     """
-    Last 300 lines of SystemOut.log and native_stderr.log (same server log dir).
-    Returns None only if both tail commands fail.
+    After start attempt 1 fails: read startServer.log first (last 300 lines).
+    If that is missing, unreadable, or not diagnostically confident, also tail
+    native_stderr.log (last 300 lines). Same server log directory as SystemOut.
+
+    Returns None only if neither startServer nor native_stderr could be read.
     """
     user = profile["ssh_user"]
     key = profile.get("ssh_key_path")
-    native_stderr_log_path = os.path.join(
-        os.path.dirname(system_out_log_path),
-        "native_stderr.log",
+    log_dir = os.path.dirname(system_out_log_path)
+    start_server_path = os.path.join(log_dir, "startServer.log")
+    native_stderr_path = os.path.join(log_dir, "native_stderr.log")
+
+    ss_res = ssh_exec(
+        host, user, key, "tail -n 300 {0}".format(start_server_path)
     )
-
-    results = []
-    for title, path in (
-        ("SystemOut.log", system_out_log_path),
-        ("native_stderr.log", native_stderr_log_path),
-    ):
-        res = ssh_exec(host, user, key, "tail -n 300 {0}".format(path))
-        results.append((title, res))
-
-    if not any(r["success"] for _, r in results):
-        return None
-
+    ss_text = (ss_res.get("stdout") or "").rstrip() if ss_res["success"] else ""
     parts = []
-    for title, res in results:
-        if res["success"]:
-            block = res["stdout"].rstrip()
+
+    if ss_res["success"]:
+        parts.append(
+            "=== startServer.log (last 300 lines; primary after first failed start) ===\n{0}".format(
+                ss_text if ss_text else "(empty)"
+            )
+        )
+    else:
+        parts.append(
+            "=== startServer.log (last 300 lines) ===\n[!] {0}".format(
+                (ss_res.get("stderr") or "tail failed").strip()
+            )
+        )
+
+    need_stderr = (not ss_res["success"]) or (
+        not is_startserver_log_confident(ss_text)
+    )
+    es_success = False
+    if need_stderr:
+        es_res = ssh_exec(
+            host, user, key, "tail -n 300 {0}".format(native_stderr_path)
+        )
+        es_success = bool(es_res["success"])
+        tag = (
+            "included because startServer.log lacked clear failure signals"
+            if ss_res["success"]
+            else "included because startServer.log could not be read"
+        )
+        if es_res["success"]:
+            block = (es_res.get("stdout") or "").rstrip()
             parts.append(
-                "=== {0} (last 300 lines) ===\n{1}".format(
-                    title, block if block else "(empty)"
+                "=== native_stderr.log (last 300 lines; {0}) ===\n{1}".format(
+                    tag, block if block else "(empty)"
                 )
             )
         else:
-            hint = (res.get("stderr") or "").strip() or "tail failed"
-            parts.append("=== {0} (last 300 lines) ===\n[!] {1}".format(title, hint))
+            parts.append(
+                "=== native_stderr.log (last 300 lines; {0}) ===\n[!] {1}".format(
+                    tag, (es_res.get("stderr") or "tail failed").strip()
+                )
+            )
 
-    return "\n\n".join(parts)
+    if ss_res["success"] or es_success:
+        return "\n\n".join(parts)
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -294,6 +368,10 @@ def get_generic_l1_context(host, profile, was_home, jvm, system_out_log_path):
         os.path.dirname(system_out_log_path),
         "native_stderr.log",
     )
+    native_stdout_log_path = os.path.join(
+        os.path.dirname(system_out_log_path),
+        "native_stdout.log",
+    )
 
     server_xml_glob = "{0}/config/cells/*/nodes/*/servers/{1}/server.xml".format(
         was_home, jvm
@@ -326,6 +404,7 @@ def get_generic_l1_context(host, profile, was_home, jvm, system_out_log_path):
             ),
         ),
         ("SystemOut.log", "tail -n 200 {0}".format(system_out_log_path)),
+        ("native_stdout.log", "tail -n 200 {0}".format(native_stdout_log_path)),
         ("SystemErr.log", "tail -n 200 {0}".format(system_err_log_path)),
         ("native_stderr.log", "tail -n 200 {0}".format(native_stderr_log_path)),
     ]
@@ -613,10 +692,26 @@ def handle_server(group_name, host, profile, global_settings):
         log_path = "{0}/logs/{1}/SystemOut.log".format(was_home, jvm)
 
         timestamp, logs = get_latest_shutdown_context(host, profile, jvm, log_path)
+        native_stdout_tail = get_native_stdout_tail(
+            host, profile, log_path, lines=200
+        )
 
+        shutdown_sections = []
         if logs:
             print("Shutdown at: {0}".format(timestamp))
+            shutdown_sections.append(
+                "SystemOut.log (context around latest shutdown):\n{0}".format(
+                    logs[-8000:]
+                )
+            )
+        if native_stdout_tail:
+            shutdown_sections.append(
+                "native_stdout.log (last 200 lines; review after SystemOut):\n{0}".format(
+                    native_stdout_tail[-4000:]
+                )
+            )
 
+        if shutdown_sections:
             ai_response = call_ai(
                 """
 You are a senior WebSphere engineer.
@@ -631,10 +726,10 @@ Tasks:
 - Root cause
 - Evidence (log lines)
 
-Logs:
+Logs (prefer SystemOut.log for shutdown markers; use native_stdout.log as supporting JVM/process output):
 {1}
 """.format(
-                    jvm, logs[-8000:]
+                    jvm, "\n\n".join(shutdown_sections)
                 )
             )
 
@@ -644,7 +739,9 @@ Logs:
             print(shutdown_text)
         else:
             print("No shutdown logs found")
-            per_jvm_info[jvm]["notes"].append("No shutdown logs found")
+            per_jvm_info[jvm]["notes"].append(
+                "No shutdown context (SystemOut shutdown window or native_stdout tail)"
+            )
 
         start_script = "{0}/bin/startServer.sh".format(was_home)
         start_command = "{0} {1}".format(start_script, jvm)
@@ -652,6 +749,7 @@ Logs:
         retry_count = global_settings.get("retry_count", 1)
         wait_time_seconds = global_settings.get("wait_time_seconds", 60)
         started_successfully = False
+        startup_logs = None
 
         for attempt in range(retry_count):
             print("\nAttempt {0}".format(attempt + 1))
@@ -677,11 +775,15 @@ Logs:
                 per_jvm_info[jvm]["recovered"] = True
                 break
 
+            if attempt == 0:
+                startup_logs = get_startup_failure_context(host, profile, log_path)
+
         if not started_successfully:
             print("Failed to start")
             per_jvm_info[jvm]["restart_attempted"] = True
 
-            startup_logs = get_startup_failure_context(host, profile, log_path)
+            if startup_logs is None:
+                startup_logs = get_startup_failure_context(host, profile, log_path)
 
             if startup_logs:
                 generic_l1_context = get_generic_l1_context(
@@ -765,7 +867,7 @@ Exact heap-related entries from server.xml:
 Exact jvmEntries line from server.xml:
 {8}
 
-Startup logs (SystemOut.log and native_stderr.log, last 300 lines each):
+Startup logs (after first failed start: startServer.log first; native_stderr.log only if startServer is inconclusive — see section headers):
 {3}
 
 Additional host/runtime diagnostic context:
