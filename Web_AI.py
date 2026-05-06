@@ -509,54 +509,114 @@ def format_ai_diagnosis(diag):
     if diag.get("diagnosis") and len(diag.keys()) == 1:
         return diag["diagnosis"]
 
+    def _src_list(val):
+        if not val:
+            return ""
+        if isinstance(val, list):
+            return ", ".join(str(s) for s in val if s)
+        return str(val)
+
     parts = []
+    n = 1
 
     jvm_name = diag.get("jvm_that_is_down") or diag.get("jvm")
     if jvm_name:
-        parts.append("1. JVM that is down:\n{0}".format(jvm_name))
+        parts.append("{0}. JVM that is down:\n{1}".format(n, jvm_name))
+        n += 1
+
+    # Shutdown analysis (JSON) — timestamp / trigger with log provenance
+    if diag.get("timestamp"):
+        src = diag.get("timestamp_source_log") or "SystemOut.log"
+        parts.append(
+            "{0}. Shutdown timestamp:\nSource log: {1}\n{2}".format(
+                n, src, diag["timestamp"]
+            )
+        )
+        n += 1
+
+    if diag.get("trigger"):
+        tr_lines = [
+            "{0}. Trigger (manual / crash / memory / deployment):".format(n),
+        ]
+        tr_src = _src_list(diag.get("trigger_source_log") or diag.get("trigger_source_logs"))
+        if tr_src:
+            tr_lines.append("Source log(s): {0}".format(tr_src))
+        tr_lines.append("{0}".format(diag["trigger"]))
+        parts.append("\n".join(tr_lines))
+        n += 1
 
     if diag.get("exact_error"):
-        parts.append("2. Exact Error:\n{0}".format(diag["exact_error"]))
+        err_lines = ["{0}. Exact Error:".format(n)]
+        src = diag.get("exact_error_source_log") or diag.get("exact_error_log")
+        if src:
+            err_lines.append("Source log: {0}".format(src))
+        else:
+            err_lines.append("Source log: (not specified — verify in evidence)")
+        err_lines.append("{0}".format(diag["exact_error"]))
+        parts.append("\n".join(err_lines))
+        n += 1
 
     if diag.get("root_cause"):
-        parts.append("3. Root Cause:\n{0}".format(diag["root_cause"]))
+        rc_lines = ["{0}. Root Cause:".format(n)]
+        src_str = _src_list(diag.get("root_cause_source_logs"))
+        if src_str:
+            rc_lines.append("Based on log(s): {0}".format(src_str))
+        rc_lines.append("{0}".format(diag["root_cause"]))
+        parts.append("\n".join(rc_lines))
+        n += 1
 
     if diag.get("evidence"):
-        parts.append("4. Evidence/L1 diagnostic:\n{0}".format(diag["evidence"]))
+        ev_lines = ["{0}. Evidence / diagnostic:".format(n)]
+        ev_str = _src_list(diag.get("evidence_source_logs"))
+        if ev_str:
+            ev_lines.append("Log references: {0}".format(ev_str))
+        ev_lines.append("{0}".format(diag["evidence"]))
+        parts.append("\n".join(ev_lines))
+        n += 1
+
+    if diag.get("severity"):
+        parts.append("{0}. Severity:\n{1}".format(n, diag["severity"]))
+        n += 1
 
     if diag.get("explanation"):
-        parts.append("5. Clear Explanation:\n{0}".format(diag["explanation"]))
+        parts.append("{0}. Clear Explanation:\n{1}".format(n, diag["explanation"]))
+        n += 1
 
     if diag.get("recommended_fix"):
-        parts.append("6. Recommended Fix:\n{0}".format(diag["recommended_fix"]))
+        parts.append("{0}. Recommended Fix:\n{1}".format(n, diag["recommended_fix"]))
+        n += 1
 
     if diag.get("console_fix_navigation"):
         parts.append(
-            "7. Check/Fix from Console by navigating to:\n{0}".format(
-                diag["console_fix_navigation"]
+            "{0}. Check/Fix from Console by navigating to:\n{1}".format(
+                n, diag["console_fix_navigation"]
             )
         )
+        n += 1
 
     if diag.get("server_start_command"):
         parts.append(
-            "8. Command for starting from server:\n{0}".format(
-                diag["server_start_command"]
+            "{0}. Command for starting from server:\n{1}".format(
+                n, diag["server_start_command"]
             )
         )
+        n += 1
 
     if diag.get("console_start_navigation"):
         parts.append(
-            "9. Start from Console by navigating to:\n{0}".format(
-                diag["console_start_navigation"]
+            "{0}. Start from Console by navigating to:\n{1}".format(
+                n, diag["console_start_navigation"]
             )
         )
+        n += 1
 
     if diag.get("post_validation_recommendation"):
         parts.append(
-            "10. Post-validation Recommendation:\n{0}".format(
-                diag["post_validation_recommendation"]
+            "{0}. Post-validation Recommendation:\n{1}".format(
+                n, diag["post_validation_recommendation"]
             )
         )
+        n += 1
 
     return "\n\n".join(parts) if parts else str(diag)
 
@@ -716,15 +776,26 @@ def handle_server(group_name, host, profile, global_settings):
                 """
 You are a senior WebSphere engineer.
 
-Analyze JVM shutdown.
+Analyze JVM shutdown for JVM: {0}
 
-JVM: {0}
+Return ONLY valid JSON.
+Do not use markdown.
+Do not wrap the response in a markdown code block.
+Do not add any explanation before or after the JSON.
 
-Tasks:
-- Exact timestamp
-- Trigger (manual / crash / memory / deployment)
-- Root cause
-- Evidence (log lines)
+Use this shape (all string fields; use lists only where shown):
+
+{{
+  "jvm": "{0}",
+  "timestamp": "exact timestamp string from logs",
+  "timestamp_source_log": "SystemOut.log | native_stdout.log (file that contains the timestamp line)",
+  "trigger": "manual | crash | memory | deployment | other (brief)",
+  "trigger_source_log": "SystemOut.log | native_stdout.log | list as JSON array if multiple",
+  "root_cause": "...",
+  "root_cause_source_logs": ["every log file that materially supports root_cause"],
+  "evidence": "Each bullet or line MUST start with [logfilename.log] then the quote or paraphrase",
+  "evidence_source_logs": ["distinct log files cited in evidence"]
+}}
 
 Logs (prefer SystemOut.log for shutdown markers; use native_stdout.log as supporting JVM/process output):
 {1}
@@ -811,10 +882,13 @@ Provide STRICT JSON response in this format:
 
 {{
   "jvm_that_is_down": "{0}",
-  "exact_error": "...",
+  "exact_error": "Verbatim or tight paraphrase of the primary failing line/message only",
+  "exact_error_source_log": "startServer.log | native_stderr.log | SystemOut.log | SystemErr.log | native_stdout.log (must match one section present in context)",
   "root_cause": "...",
+  "root_cause_source_logs": ["same convention as filenames above; one or more logs you relied on"],
   "severity": "Low|Medium|High|Critical",
-  "evidence": "...",
+  "evidence": "Quotes/snippets; EACH bullet or paragraph MUST start with [logfilename.log] prefix",
+  "evidence_source_logs": ["list every log filename you cited brackets for, no duplicates"],
   "explanation": "...",
   "recommended_fix": "...",
   "server_check_path": "...",
@@ -825,7 +899,6 @@ Provide STRICT JSON response in this format:
   ],
   "post_validation_recommendation": "...",
   "server_start_command": "{5}",
-  "console_fix_navigation": "Servers > Server Types > WebSphere application servers > sharedcl01_wsvmt7_01 > Java and Process Management > Process Definition > Java Virtual Machine"
   "console_start_navigation": "Servers > Server Types > WebSphere application servers > {0} > Select the JVM > Click Start"
 }}
 
@@ -856,6 +929,12 @@ Important:
 - If the issue is configuration related, provide the exact file/path on server in server_check_path.
 - The recommendation should be operational, clear, and directly usable by L1/L2 support.
 - Mention how to start the JVM after fix from server and from console.
+
+Log provenance (mandatory — operators must see which file each finding came from):
+- exact_error_source_log MUST name the single log file that contains the exact_error text (never leave empty).
+- root_cause_source_logs MUST list every log file that materially supports the root_cause (order: most important first).
+- In evidence, every bullet or paragraph MUST begin with "[logfilename.log]" matching a file from the pasted context (startup sections, SystemOut/native_stdout/SystemErr/native_stderr, or Additional host/runtime blocks — use labels like "[SystemOut.log]" "[native_stdout.log]" "[server.xml excerpt]" "[Memory Summary]" as appropriate).
+- evidence_source_logs MUST list each distinct log/source tag you used in evidence (e.g. "startServer.log", "native_stderr.log", "SystemOut.log").
 
 Exact resolved WebSphere config path for this JVM:
 Server XML path:
